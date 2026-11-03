@@ -1,12 +1,7 @@
 //! Agent tasks: natural-language tasks and routines that Wayfern's engine runs
-//! in a profile's browser. Donut is the interface only. It mints the agent
-//! token, launches the profiles, starts, steers and stops tasks over CDP,
-//! records what the engine reports, and tells the cloud how each routine run
-//! ended. No prompt is written, and no model is called, here.
-//!
-//! Everything is behind the `agent` entitlement, a rollout flag the cloud sets
-//! per account on any plan. Signed out, or without it, every command refuses
-//! with `AGENT_NOT_ENTITLED` and nothing reaches the cloud agent routes.
+//! in a profile's browser. Local batches and chats use the engine over CDP;
+//! cloud routines, schedules, credits and token issuance remain hosted services.
+//! No prompt is written, and no model is called, here.
 
 mod batch;
 pub mod chat;
@@ -185,9 +180,10 @@ fn publish(batch: &Batch) {
   let _ = crate::events::emit("agent-batch", BatchView::from(batch));
 }
 
-// ---- Entitlement and engine support ----
+// ---- Hosted entitlement and engine support ----
 
-async fn ensure_entitled() -> Result<(), String> {
+/// Keep hosted agent services plan-gated; local batches and chats do not use it.
+async fn ensure_cloud_agent_entitled() -> Result<(), String> {
   #[cfg(feature = "e2e")]
   if mock::active() {
     return Ok(());
@@ -766,7 +762,7 @@ async fn run_routine(
 
 /// A routine the cloud fired on its schedule, over the remote bridge.
 pub(crate) async fn run_routine_from_cloud(params: &Value) -> Result<Value, String> {
-  ensure_entitled().await?;
+  ensure_cloud_agent_entitled().await?;
   let routine_id = params
     .get("routineId")
     .and_then(Value::as_str)
@@ -785,12 +781,6 @@ pub(crate) async fn run_routine_from_cloud(params: &Value) -> Result<Value, Stri
 
 #[tauri::command]
 pub async fn get_agent_engine_status() -> EngineStatus {
-  if ensure_entitled().await.is_err() {
-    return EngineStatus {
-      supported: false,
-      checked: true,
-    };
-  }
   #[cfg(feature = "e2e")]
   if mock::active() {
     return EngineStatus {
@@ -826,7 +816,7 @@ pub async fn get_agent_engine_status() -> EngineStatus {
 
 #[tauri::command]
 pub async fn get_agent_credits() -> Result<Credits, String> {
-  ensure_entitled().await?;
+  ensure_cloud_agent_entitled().await?;
   cloud::credits().await
 }
 
@@ -847,7 +837,6 @@ pub struct TaskRequest {
 
 #[tauri::command]
 pub async fn start_agent_batch(request: TaskRequest) -> Result<BatchView, String> {
-  ensure_entitled().await?;
   let (prompt, start_url) = cloud::checked_order(&request.prompt, request.start_url.as_deref())?;
   if request.max_credits == Some(0) {
     return Err(crate::backend_error("AGENT_ROUTINE_INVALID"));
@@ -870,7 +859,6 @@ pub async fn start_agent_batch(request: TaskRequest) -> Result<BatchView, String
 
 #[tauri::command]
 pub async fn list_agent_batches() -> Result<Vec<BatchView>, String> {
-  ensure_entitled().await?;
   Ok(store().batches.iter().rev().map(BatchView::from).collect())
 }
 
@@ -879,7 +867,6 @@ pub async fn get_agent_task_steps(
   batch_id: String,
   profile_id: String,
 ) -> Result<Vec<Step>, String> {
-  ensure_entitled().await?;
   let store = store();
   store
     .batches
@@ -959,7 +946,6 @@ pub async fn control_agent_task(
   action: String,
   message: Option<String>,
 ) -> Result<(), String> {
-  ensure_entitled().await?;
   let mut params = match action.as_str() {
     "pause" | "resume" | "stop" => json!({}),
     "steer" => json!({ "message": checked_steer(message)? }),
@@ -994,7 +980,6 @@ pub async fn answer_agent_approval(
   approve: bool,
   text: Option<String>,
 ) -> Result<(), String> {
-  ensure_entitled().await?;
   let (link, task_id) = active_task(&batch_id, &profile_id)?;
   let mut params = json!({ "taskId": task_id, "approvalId": approval_id, "approve": approve });
   if let Some(text) = text.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
@@ -1017,7 +1002,6 @@ pub async fn answer_agent_approval(
 
 #[tauri::command]
 pub async fn stop_agent_batch(batch_id: String) -> Result<(), String> {
-  ensure_entitled().await?;
   let running = {
     let mut store = store();
     let batch = store
@@ -1045,7 +1029,6 @@ pub async fn stop_agent_batch(batch_id: String) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn retry_agent_batch(batch_id: String) -> Result<usize, String> {
-  ensure_entitled().await?;
   let count = {
     let mut store = store();
     let batch = store
@@ -1064,7 +1047,6 @@ pub async fn retry_agent_batch(batch_id: String) -> Result<usize, String> {
 
 #[tauri::command]
 pub async fn dismiss_agent_batch(batch_id: String) -> Result<(), String> {
-  ensure_entitled().await?;
   let mut store = store();
   let index = store
     .batches
@@ -1081,7 +1063,7 @@ pub async fn dismiss_agent_batch(batch_id: String) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn list_agent_routines() -> Result<Vec<Routine>, String> {
-  ensure_entitled().await?;
+  ensure_cloud_agent_entitled().await?;
   cloud::list_routines().await
 }
 
@@ -1094,27 +1076,27 @@ async fn ensure_schedule_allowed(draft: &RoutineDraft) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn create_agent_routine(routine: RoutineDraft) -> Result<Routine, String> {
-  ensure_entitled().await?;
+  ensure_cloud_agent_entitled().await?;
   ensure_schedule_allowed(&routine).await?;
   cloud::create_routine(routine).await
 }
 
 #[tauri::command]
 pub async fn update_agent_routine(id: String, routine: RoutineDraft) -> Result<Routine, String> {
-  ensure_entitled().await?;
+  ensure_cloud_agent_entitled().await?;
   ensure_schedule_allowed(&routine).await?;
   cloud::update_routine(&id, routine).await
 }
 
 #[tauri::command]
 pub async fn delete_agent_routine(id: String) -> Result<(), String> {
-  ensure_entitled().await?;
+  ensure_cloud_agent_entitled().await?;
   cloud::delete_routine(&id).await
 }
 
 #[tauri::command]
 pub async fn list_agent_routine_runs(id: String) -> Result<Vec<RoutineRun>, String> {
-  ensure_entitled().await?;
+  ensure_cloud_agent_entitled().await?;
   cloud::list_runs(&id).await
 }
 
@@ -1123,7 +1105,7 @@ pub async fn run_agent_routine(
   id: String,
   profile_ids: Option<Vec<String>>,
 ) -> Result<BatchView, String> {
-  ensure_entitled().await?;
+  ensure_cloud_agent_entitled().await?;
   let routine = cloud::get_routine(&id).await?;
   run_routine(routine, profile_ids, None).await
 }

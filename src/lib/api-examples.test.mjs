@@ -131,11 +131,8 @@ test("local examples only call routes the app publishes", () => {
   }
 });
 
-test("only the automation routes are marked paid", () => {
-  assert.deepEqual(
-    LOCAL_API_EXAMPLES.filter((example) => example.paid).map((e) => e.id),
-    ["runProfile", "openUrl", "killProfile"],
-  );
+test("local API examples do not require a paid plan", () => {
+  assert.ok(LOCAL_API_EXAMPLES.every((example) => !example.paid));
 });
 
 test("a token is shown by its ends, never whole", () => {

@@ -62,11 +62,7 @@ import { useAgentChats } from "@/hooks/use-agent-chat";
 import type { AgentConsole } from "@/hooks/use-agent-console";
 import { useAgentBatches, useAgentCredits } from "@/hooks/use-agent-tasks";
 import { MAX_TEXT_CHARS, profileRollup, quotaLeft } from "@/lib/agent-console";
-import {
-  canUseRemoteControl,
-  canUseScheduledAutomation,
-  getEntitlements,
-} from "@/lib/entitlements";
+import { canUseScheduledAutomation, getEntitlements } from "@/lib/entitlements";
 import type { McpRemoteStatus } from "@/lib/mcp";
 import { showSuccessToast } from "@/lib/toast-utils";
 import { cn } from "@/lib/utils";
@@ -353,12 +349,10 @@ export function AgentPage({
     setFocusComposer(false);
   }, []);
 
-  const signedIn = cloudUser !== null;
-  const entitled = canUseRemoteControl(cloudUser);
   const automation = getEntitlements(cloudUser).browserAutomation;
   // Solo keeps recipes for the schedules it pays for, without on-demand runs.
   const scheduled = canUseScheduledAutomation(cloudUser);
-  const blocker = !signedIn ? "signedOut" : !entitled ? "plan" : null;
+  const blocker = cloudUser === null ? "signedOut" : null;
   const remoteOff = remoteKnown && remote !== null && !remote.enabled;
   const hasSessions = agentConsole.sessions.length > 0;
   const quota = quotaLeft(agentConsole.quota);
@@ -410,26 +404,6 @@ export function AgentPage({
         >
           {t("agent.setup.signedOutAction")}
         </RippleButton>
-      </SetupPanel>
-    ) : blocker === "plan" ? (
-      <SetupPanel
-        testId="agent-setup-plan"
-        icon={<LuLock />}
-        title={t("agent.setup.planTitle")}
-        body={t("agent.setup.planBody")}
-      >
-        <div className="flex items-center gap-2">
-          <ProBadge />
-          <Button
-            size="sm"
-            variant="soft"
-            className="h-8 rounded-lg text-xs"
-            data-testid="agent-setup-plan-account"
-            onClick={onOpenAccount}
-          >
-            {t("agent.setup.planAction")}
-          </Button>
-        </div>
       </SetupPanel>
     ) : null;
 

@@ -9,7 +9,7 @@
 
 use super::engine::{EngineError, EngineLink};
 use super::model::{EngineEvent, Task, TaskStatus};
-use super::{attach, ensure_entitled, error_code, load_profile, now_ms};
+use super::{attach, error_code, load_profile, now_ms};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -665,7 +665,6 @@ fn checked_text(text: &str) -> Result<String, String> {
 
 #[tauri::command]
 pub async fn list_agent_chats() -> Result<Vec<ChatSummary>, String> {
-  ensure_entitled().await?;
   let store = chats();
   let mut list: Vec<ChatSummary> = store.chats.values().map(Chat::summary).collect();
   list.sort_by_key(|chat| std::cmp::Reverse(chat.updated_at));
@@ -674,7 +673,6 @@ pub async fn list_agent_chats() -> Result<Vec<ChatSummary>, String> {
 
 #[tauri::command]
 pub async fn get_agent_chat(chat_id: String) -> Result<Chat, String> {
-  ensure_entitled().await?;
   chats().get(&chat_id).cloned()
 }
 
@@ -682,7 +680,6 @@ pub async fn get_agent_chat(chat_id: String) -> Result<Chat, String> {
 /// when it is not running.
 #[tauri::command]
 pub async fn create_agent_chat(profile_id: String, text: String) -> Result<Chat, String> {
-  ensure_entitled().await?;
   let text = checked_text(&text)?;
   load_profile(&profile_id)?;
   let chat = Chat::new(&profile_id, text, now_ms());
@@ -702,7 +699,6 @@ pub async fn create_agent_chat(profile_id: String, text: String) -> Result<Chat,
 /// A message in a chat: a steer while a turn runs, else the next turn.
 #[tauri::command]
 pub async fn send_agent_chat_message(chat_id: String, text: String) -> Result<Chat, String> {
-  ensure_entitled().await?;
   let running = chats().get(&chat_id)?.is_active();
   if running {
     let message = super::checked_steer(Some(text))?;
@@ -746,7 +742,6 @@ pub async fn send_agent_chat_message(chat_id: String, text: String) -> Result<Ch
 
 #[tauri::command]
 pub async fn control_agent_chat(chat_id: String, action: String) -> Result<(), String> {
-  ensure_entitled().await?;
   if !matches!(action.as_str(), "pause" | "resume" | "stop") {
     return Err(crate::backend_error("AGENT_ACTION_INVALID"));
   }
@@ -789,7 +784,6 @@ pub async fn answer_agent_chat_approval(
   approve: bool,
   text: Option<String>,
 ) -> Result<(), String> {
-  ensure_entitled().await?;
   let (link, task_id) = running_turn(&chat_id)?;
   let mut params = json!({ "taskId": task_id, "approvalId": approval_id, "approve": approve });
   if let Some(text) = text.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
@@ -812,7 +806,6 @@ pub async fn answer_agent_chat_approval(
 
 #[tauri::command]
 pub async fn delete_agent_chat(chat_id: String) -> Result<(), String> {
-  ensure_entitled().await?;
   if chats().get(&chat_id)?.is_active() {
     let _ = control_agent_chat(chat_id.clone(), "stop".to_string()).await;
   }

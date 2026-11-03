@@ -1058,9 +1058,6 @@ fn result_frame(cid: &str, outcome: McpOutcome) -> serde_json::Value {
     McpOutcome::BadRequest => serde_json::json!({
       "t": "result", "cid": cid, "status": "badRequest",
     }),
-    McpOutcome::RateLimited { retry_after_secs } => serde_json::json!({
-      "t": "result", "cid": cid, "status": "rateLimited", "retryAfter": retry_after_secs,
-    }),
   }
 }
 
@@ -1925,15 +1922,6 @@ mod tests {
       result_frame("c4", McpOutcome::BadRequest)["status"],
       "badRequest"
     );
-
-    let limited = result_frame(
-      "c5",
-      McpOutcome::RateLimited {
-        retry_after_secs: 42,
-      },
-    );
-    assert_eq!(limited["status"], "rateLimited");
-    assert_eq!(limited["retryAfter"], 42);
   }
 
   #[test]

@@ -1,228 +1,65 @@
 import type { CloudUser, Entitlements } from "@/types";
 
-const DEFAULT_REQUESTS_PER_HOUR = 100;
+const UNLIMITED = Number.MAX_SAFE_INTEGER;
 
-interface Capabilities {
-  browserAutomation: boolean;
-  crossOsFingerprints: boolean;
-  cloudBackup: boolean;
-  teamCollaboration: boolean;
-  cookieBot: boolean;
-  remoteInteractive: boolean;
-  remoteControl: boolean;
-  scheduledAutomation: boolean;
-}
-
-const NONE: Entitlements = {
-  active: false,
-  browserAutomation: false,
-  crossOsFingerprints: false,
-  cloudBackup: false,
-  teamCollaboration: false,
-  cookieBot: false,
-  remoteInteractive: false,
-  remoteControl: false,
-  scheduledAutomation: false,
-  agent: false,
-  profileLimit: 0,
-  requestsPerHour: 0,
-  remoteBrowserHours: 0,
-};
-
-// Mirror of the plan capability matrix the API resolves. Keep in sync — a new
-// plan must be declared here too, or it falls back to DEFAULT_PAID.
-const PLAN_CAPABILITIES: Record<string, Capabilities> = {
-  // Solo pays for a nightly bot and MCP without browser automation. No
-  // fingerprint editing either.
-  solo: {
-    browserAutomation: false,
-    crossOsFingerprints: false,
-    cloudBackup: true,
-    teamCollaboration: false,
-    cookieBot: true,
-    remoteInteractive: false,
-    remoteControl: true,
-    scheduledAutomation: true,
-  },
-  pro: {
-    browserAutomation: true,
-    crossOsFingerprints: true,
-    cloudBackup: true,
-    teamCollaboration: false,
-    cookieBot: true,
-    remoteInteractive: true,
-    remoteControl: true,
-    scheduledAutomation: true,
-  },
-  team: {
-    browserAutomation: true,
-    crossOsFingerprints: true,
-    cloudBackup: true,
-    teamCollaboration: true,
-    cookieBot: true,
-    remoteInteractive: true,
-    remoteControl: true,
-    scheduledAutomation: true,
-  },
-  enterprise: {
-    browserAutomation: true,
-    crossOsFingerprints: true,
-    cloudBackup: true,
-    teamCollaboration: true,
-    cookieBot: true,
-    remoteInteractive: true,
-    remoteControl: true,
-    scheduledAutomation: true,
-  },
-};
-
-// Unknown paid plan -> pro-level (never team), the conservative reading.
-// remoteControl is the one exception and is withheld: an unrecognised plan
-// string must not open an internet-facing hook into this machine.
-const DEFAULT_PAID: Capabilities = {
+const LOCAL_ENTITLEMENTS: Entitlements = {
+  active: true,
   browserAutomation: true,
   crossOsFingerprints: true,
   cloudBackup: true,
-  teamCollaboration: false,
+  teamCollaboration: true,
   cookieBot: true,
   remoteInteractive: true,
-  remoteControl: false,
-  scheduledAutomation: false,
+  remoteControl: true,
+  scheduledAutomation: true,
+  agent: true,
+  profileLimit: UNLIMITED,
+  requestsPerHour: UNLIMITED,
+  // Local use has no hour cap; the hosted quota route remains authoritative.
+  remoteBrowserHours: UNLIMITED,
 };
 
-/**
- * The user's effective entitlements. Prefers the backend-resolved object the
- * desktop attaches to CloudUser; only falls back to deriving from the plan
- * fields when it's missing (older cached state). The fallback mirrors the
- * capability matrix the API resolves.
- */
+/** Local features do not depend on a cloud account or its plan response. */
 export function getEntitlements(
-  user: CloudUser | null | undefined,
+  _user: CloudUser | null | undefined,
 ): Entitlements {
-  if (user?.entitlements) {
-    const server = user.entitlements;
-    // A backend (or a cached login) older than the current release omits these
-    // keys. Reading them as `undefined` would hide a paid feature from a paying
-    // customer with nothing logged anywhere, so resolve them here — the one
-    // place every caller already goes through.
-    //
-    // Both absent flags fall back to `browserAutomation`, which is what they
-    // were derived from before solo existed: on every plan a pre-solo backend
-    // knows about, automation implied both the bot and interactive remote
-    // control. A solo user never hits this branch — the backend that can put
-    // them on solo is by definition new enough to send both keys.
-    //
-    // `remoteBrowserHours` stays 0 because the spendable figure is whatever
-    // `get_remote_hours_quota` reports, never a client guess.
-    return {
-      ...server,
-      cookieBot: server.cookieBot ?? server.browserAutomation,
-      remoteInteractive: server.remoteInteractive ?? server.browserAutomation,
-      // Not back-filled from anything. A backend too old to send this key is a
-      // backend with no remote-control endpoint to be entitled to, so `false`
-      // is the true answer rather than a conservative guess.
-      remoteControl: server.remoteControl ?? false,
-      scheduledAutomation: server.scheduledAutomation ?? false,
-      agent: server.agent ?? false,
-      remoteBrowserHours: server.remoteBrowserHours ?? 0,
-    };
-  }
-  if (!user) return NONE;
-
-  const active =
-    user.plan !== "free" &&
-    (user.subscriptionStatus === "active" || user.planPeriod === "lifetime");
-  if (!active) return NONE;
-
-  const caps = PLAN_CAPABILITIES[user.plan] ?? DEFAULT_PAID;
-  return {
-    active: true,
-    browserAutomation: caps.browserAutomation,
-    crossOsFingerprints: caps.crossOsFingerprints,
-    cloudBackup: caps.cloudBackup,
-    teamCollaboration: caps.teamCollaboration,
-    cookieBot: caps.cookieBot,
-    remoteInteractive: caps.remoteInteractive,
-    remoteControl: caps.remoteControl,
-    scheduledAutomation: caps.scheduledAutomation,
-    // A hidden rollout flag: only the server grants it, never the plan.
-    agent: false,
-    profileLimit: user.profileLimit,
-    requestsPerHour: caps.browserAutomation ? DEFAULT_REQUESTS_PER_HOUR : 0,
-    remoteBrowserHours: 0,
-  };
+  return { ...LOCAL_ENTITLEMENTS };
 }
 
-/**
- * The plan this account is served under. A team member's own `plan` is
- * `"free"` (the owner pays) while the backend resolves `effectivePlan` to the
- * owner's tier. The login response and an older backend omit the key, and then
- * the row's own plan is the only answer there is. Every "what plan is this?"
- * label or gate goes through here; billing surfaces keep reading `plan`,
- * because a seat has no subscription of its own.
- */
+/** The account's effective cloud plan, used by billing and display surfaces. */
 export function effectivePlanOf(user: CloudUser | null | undefined): string {
   return user?.effectivePlan ?? user?.plan ?? "free";
 }
 
-/**
- * Whether this user may enrol profiles in Cookie Bot. Every gate in the UI
- * goes through here so a plan change is one edit, and so the Pro badge and the
- * control it guards can never disagree.
- */
-/** Recipes on a schedule: Solo, Pro, Team and Enterprise. */
+/** Recipes on a schedule: available locally regardless of cloud plan. */
 export function canUseScheduledAutomation(
   user: CloudUser | null | undefined,
 ): boolean {
-  const entitlements = getEntitlements(user);
-  return entitlements.active && entitlements.scheduledAutomation;
+  return getEntitlements(user).scheduledAutomation;
 }
 
-/**
- * Whether the account has the agent rollout flag. Any plan, including free;
- * signed out is never. The UI also needs a Wayfern that supports the engine.
- */
+/** Local agent features are not tied to the account rollout flag. */
 export function hasAgentAccess(user: CloudUser | null | undefined): boolean {
-  if (!user) return false;
   return getEntitlements(user).agent;
 }
 
 export function canUseCookieBot(user: CloudUser | null | undefined): boolean {
-  const entitlements = getEntitlements(user);
-  return entitlements.active && entitlements.cookieBot;
+  return getEntitlements(user).cookieBot;
 }
 
-/**
- * Whether this user may drive this desktop from donutbrowser.com.
- *
- * The bridge itself does not read this, the server decides who may send work,
- * and a cached entitlement that is a refresh cycle out of date must not be what
- * refuses a customer their own machine. This is what the UI reads to explain
- * WHY a connected desktop cannot be driven.
- */
+/** The UI capability is local; cloud service calls still require their own auth. */
 export function canUseRemoteControl(
   user: CloudUser | null | undefined,
 ): boolean {
-  const entitlements = getEntitlements(user);
-  return entitlements.active && entitlements.remoteControl;
+  return getEntitlements(user).remoteControl;
 }
 
-/**
- * Only a team owner sees per-member attribution. An admin can change team
- * settings but the pooled spend is the owner's bill.
- */
+/** Only a team owner sees per-member attribution. */
 export function isTeamOwner(user: CloudUser | null | undefined): boolean {
-  return (
-    getEntitlements(user).teamCollaboration &&
-    user?.teamRole === "owner" &&
-    Boolean(user.teamId)
-  );
+  return Boolean(user?.teamId && user.teamRole === "owner");
 }
 
-/**
- * A team seat that may open the team's profiles and keep what a session
- * changes, but not change the team's profiles, proxies or groups.
- */
+/** A launcher seat may open team profiles but cannot edit team data. */
 export function isTeamLauncher(user: CloudUser | null | undefined): boolean {
   return Boolean(user?.teamId) && user?.teamRole === "launcher";
 }
@@ -232,7 +69,6 @@ export function canViewTeamActivity(
   user: CloudUser | null | undefined,
 ): boolean {
   return (
-    getEntitlements(user).teamCollaboration &&
     Boolean(user?.teamId) &&
     (user?.teamRole === "owner" || user?.teamRole === "admin")
   );

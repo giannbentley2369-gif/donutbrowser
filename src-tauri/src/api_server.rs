@@ -5,14 +5,16 @@ use crate::log_redaction::{Plain, ShortId};
 use crate::profile::manager::ProfileManager;
 use crate::proxy_manager::PROXY_MANAGER;
 use crate::tag_manager::TAG_MANAGER;
+#[cfg(feature = "e2e")]
+use axum::response::IntoResponse;
 use axum::{
   extract::{
     ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
     DefaultBodyLimit, Path, Query, State,
   },
-  http::{header, HeaderMap, Method, StatusCode},
+  http::{HeaderMap, StatusCode},
   middleware::{self, Next},
-  response::{IntoResponse, Json, Response},
+  response::{Json, Response},
   routing::get,
   Router,
 };
@@ -1108,7 +1110,6 @@ impl ApiServer {
 
     let v1_routes = v1_routes
       // Innermost so only authenticated automation requests consume quota.
-      .layer(middleware::from_fn(rate_limit_middleware))
       .layer(middleware::from_fn_with_state(
         state.clone(),
         auth_middleware,
@@ -1178,7 +1179,6 @@ async fn e2e_mcp_message(headers: HeaderMap, body: axum::body::Bytes) -> Respons
     McpOutcome::Accepted => StatusCode::ACCEPTED.into_response(),
     McpOutcome::UnknownSession => StatusCode::NOT_FOUND.into_response(),
     McpOutcome::BadRequest => StatusCode::BAD_REQUEST.into_response(),
-    McpOutcome::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS.into_response(),
   }
 }
 
@@ -1391,98 +1391,6 @@ async fn request_logging_middleware(request: axum::extract::Request, next: Next)
   response
 }
 
-fn is_automation_request(method: &Method, path: &str) -> bool {
-  // Ending a remote session is the one automation action that is not a POST.
-  // Its handler declares a 429, which could never fire while this function
-  // returned early for every non-POST method.
-  //
-  // Cancelling a cookie-bot run joins it: both reach across to the fleet, and
-  // treating one stop as metered and the other as free would be arbitrary.
-  // Note that the desktop's own stop button goes through a Tauri command, not
-  // this server, so a human can always stop a run the limiter has cut off.
-  if method == Method::DELETE {
-    let mut segments = match path
-      .strip_prefix("/v1/remote-sessions/")
-      .or_else(|| path.strip_prefix("/v1/cookie-bot/runs/"))
-    {
-      Some(rest) => rest.split('/'),
-      None => return false,
-    };
-    return matches!((segments.next(), segments.next()), (Some(id), None) if !id.is_empty());
-  }
-
-  if method != Method::POST {
-    return false;
-  }
-
-  // Starting a bot run leases a host for up to two hours and spends the
-  // account's pooled remote-hour budget, which makes it the single most
-  // expensive thing this API can be asked to do.
-  //
-  // Deliberately NOT here: the cookie-bot schedule writes (PUT and DELETE on
-  // /v1/cookie-bot/schedules/{profile_id}). They are configuration and lease
-  // nothing. Metering them would 429 a client enrolling many profiles at
-  // start-up, and they are not what spends the account's hours.
-  if matches!(
-    path,
-    "/v1/profiles/batch/run" | "/v1/profiles/batch/stop" | "/v1/cookie-bot/runs"
-  ) {
-    return true;
-  }
-
-  let Some(profile_action) = path.strip_prefix("/v1/profiles/") else {
-    return false;
-  };
-  let mut segments = profile_action.split('/');
-  matches!(
-    (
-      segments.next(),
-      segments.next(),
-      segments.next(),
-      segments.next()
-    ),
-    // `run-remote` is a separate segment from `run`, so it matched nothing here
-    // and every remote launch bypassed the quota it declares a 429 for.
-    (
-      Some(_),
-      Some("run" | "open-url" | "kill" | "run-remote"),
-      None,
-      None
-    ) | (
-      // The agent surface reads and drives the same browser the tools above
-      // launch, through the same paid gate; a native page read is automation
-      // exactly as a script one is.
-      Some(_),
-      Some("agent"),
-      Some("perceive" | "resolve-locator" | "click" | "hold" | "type" | "extract" | "pick"),
-      None
-    )
-  )
-}
-
-async fn rate_limit_middleware(request: axum::extract::Request, next: Next) -> Response {
-  if !is_automation_request(request.method(), request.uri().path()) {
-    return next.run(request).await;
-  }
-
-  match crate::automation_rate_limiter::check_automation_rate_limit().await {
-    crate::automation_rate_limiter::RateLimitOutcome::Limited { retry_after_secs } => {
-      log::debug!(
-        "API automation rate limited path={} retry_after_s={retry_after_secs}",
-        request.uri().path()
-      );
-      (
-        StatusCode::TOO_MANY_REQUESTS,
-        [(header::RETRY_AFTER, retry_after_secs.to_string())],
-        "automation request rate limit exceeded",
-      )
-        .into_response()
-    }
-    crate::automation_rate_limiter::RateLimitOutcome::Unlimited
-    | crate::automation_rate_limiter::RateLimitOutcome::Allowed { .. } => next.run(request).await,
-  }
-}
-
 // Global API server instance
 pub static API_SERVER: std::sync::LazyLock<Arc<Mutex<ApiServer>>> =
   std::sync::LazyLock::new(|| Arc::new(Mutex::new(ApiServer::new())));
@@ -1567,13 +1475,9 @@ fn manager_error_response(err: impl std::fmt::Display) -> (StatusCode, String) {
         // cannot be proven safe, which is an upstream failure, not the
         // caller's fault.
         StatusCode::SERVICE_UNAVAILABLE
-      } else if code.ends_with("_REQUIRES_PRO")
-        || code.ends_with("_PAYMENT_REQUIRED")
-        || code.ends_with("_REQUIRES_PLAN")
-      {
-        // Paid-feature gates (FINGERPRINT_REQUIRES_PRO, PROXY_PAYMENT_REQUIRED).
-        // Mapping them here lets the gate live in the shared manager instead of
-        // being re-implemented in each handler to get the status right.
+      } else if code.ends_with("_PAYMENT_REQUIRED") {
+        // Keep billing failures such as expired proxy subscriptions distinct
+        // from local feature entitlements.
         StatusCode::PAYMENT_REQUIRED
       } else if code == "WAYFERN_CROSS_OS_PRIMARY_DEVICE" {
         // The plan includes it; the server refuses this desktop because
@@ -1725,7 +1629,6 @@ async fn get_profile(
     (status = 200, description = "The device the profile presents", body = ApiProfileFingerprintResponse),
     (status = 400, description = "The browser could not rebuild the device"),
     (status = 401, description = "Unauthorized"),
-    (status = 402, description = "The profile's fingerprint OS needs a paid plan"),
     (status = 404, description = "Profile not found"),
     (status = 500, description = "Internal server error"),
     (status = 503, description = "The device could not be read right now; try again")
@@ -1761,11 +1664,11 @@ async fn get_profile_fingerprint_api(
 /// - Omitting the matching `wayfern_config`, or passing an
 ///   empty object `{}`, generates a fresh fingerprint automatically.
 /// - `wayfern_config.os` picks the fingerprint OS (`"windows"`, `"macos"`,
-///   `"linux"`, `"android"`, `"ios"`). Omit it to match the host. Any other
-///   OS is cross-OS spoofing and needs an active Pro plan; 402 otherwise.
-///   A `wayfern_config` that fails to parse is a 400, never a silent default.
+///   `"linux"`, `"android"`, `"ios"`). Omit it to match the host. Supported
+///   cross-OS fingerprints do not require a paid plan. A `wayfern_config` that
+///   fails to parse is a 400, never a silent default.
 /// - `wayfern_config.launch_args` accepts up to 64 `--name` or
-///   `--name=value` strings on plans with browser automation (402 otherwise).
+///   `--name=value` strings without a plan requirement.
 ///   Each string is one argument. Only supported switches are accepted (for
 ///   example `--disable-gpu`, `--mute-audio`, `--disable-features=Name`);
 ///   anything else, including the switches Donut manages, is refused with 400.
@@ -1779,7 +1682,7 @@ async fn get_profile_fingerprint_api(
     (status = 200, description = "Profile created successfully", body = ApiProfileResponse),
     (status = 400, description = "Invalid browser, invalid wayfern_config, invalid dns_server, or no downloaded version available"),
     (status = 401, description = "Unauthorized"),
-    (status = 402, description = "Selected proxy requires payment, or a cross-OS fingerprint or custom launch arguments require Pro"),
+    (status = 402, description = "The selected proxy requires payment"),
     (status = 429, description = "Hourly profile generation limit reached; the body carries retryAfterSeconds"),
     (status = 500, description = "Internal server error")
   ),
@@ -1849,19 +1752,6 @@ async fn create_profile(
     })?),
     None => None,
   };
-
-  // Cross-OS fingerprints are a paid capability. The Tauri command, the
-  // importer and MCP each check this; REST did not, so the restriction was
-  // bypassable through this endpoint alone.
-  if !crate::cloud_auth::CLOUD_AUTH
-    .is_fingerprint_os_allowed(wayfern_config.as_ref().and_then(|c| c.os.as_deref()))
-    .await
-  {
-    return Err((
-      StatusCode::PAYMENT_REQUIRED,
-      serde_json::json!({ "code": "FINGERPRINT_REQUIRES_PRO" }).to_string(),
-    ));
-  }
 
   // Reject a dead/unreachable proxy or VPN before creating the profile. A 402
   // (expired proxy subscription) maps to 402; anything else is a 400.
@@ -2610,7 +2500,7 @@ async fn delete_template(Path(id): Path<String>) -> Result<StatusCode, (StatusCo
     (status = 200, description = "Profiles made with the newest downloaded Wayfern, each with its own device. When `error` is set, creation stopped early and `profiles` lists what was made", body = ApiBulkCreateResponse),
     (status = 400, description = "Count outside 1 to 100, empty name, a name in use, or a proxy or VPN that does not work"),
     (status = 401, description = "Unauthorized"),
-    (status = 402, description = "The template's fingerprint OS needs a paid plan"),
+    (status = 402, description = "A proxy used by the template requires payment"),
     (status = 404, description = "Template not found"),
     (status = 409, description = "Another bulk creation is running"),
     (status = 429, description = "The hourly profile allowance is used up; nothing was made")
@@ -3558,10 +3448,8 @@ async fn remove_extension_from_group_api(
     (status = 200, description = "Profile launched successfully", body = RunProfileResponse),
     (status = 400, description = "Cannot launch cross-OS profile, or the url is not an http, https or about:blank address"),
     (status = 401, description = "Unauthorized"),
-    (status = 402, description = "Active paid plan with browser automation required"),
     (status = 404, description = "Profile not found"),
     (status = 409, description = "Profile is locked by another team member, running on the remote fleet, or waiting for a finished remote session to be pulled back"),
-    (status = 429, description = "Automation request rate limit exceeded"),
     (status = 503, description = "The profile lock service could not be reached, or the profile's files could not be downloaded from sync before its first launch here"),
     (status = 500, description = "Internal server error")
   ),
@@ -3575,13 +3463,6 @@ async fn run_profile(
   State(state): State<ApiServerState>,
   Json(request): Json<RunProfileRequest>,
 ) -> Result<Json<RunProfileResponse>, (StatusCode, String)> {
-  if !crate::cloud_auth::CLOUD_AUTH
-    .can_use_browser_automation()
-    .await
-  {
-    return Err((StatusCode::PAYMENT_REQUIRED, String::new()));
-  }
-
   let headless = request.headless.unwrap_or(false);
   let url = request.url;
   // Same allowlist the MCP surface enforces, from the same predicate so the two
@@ -3688,7 +3569,6 @@ async fn run_profile(
     (status = 402, description = "Active paid plan with browser automation required"),
     (status = 404, description = "Profile not found"),
     (status = 409, description = "Profile is locked by another session"),
-    (status = 429, description = "Automation request rate limit exceeded"),
     (status = 503, description = "No remote capacity for this operating system"),
     (status = 500, description = "Internal server error")
   ),
@@ -3919,7 +3799,6 @@ pub fn remote_launch_profile_rules(
     (status = 200, description = "Remote session stopped", body = StopRemoteResponse),
     (status = 401, description = "Unauthorized"),
     (status = 404, description = "No such remote session"),
-    (status = 429, description = "Automation request rate limit exceeded"),
     (status = 503, description = "The fleet could not be reached; the session is still running"),
     (status = 500, description = "Internal server error")
   ),
@@ -4599,7 +4478,6 @@ async fn list_cookie_bot_runs(
     (status = 403, description = "This desktop is not signed in to Donut cloud"),
     (status = 404, description = "Profile not found, or not enrolled"),
     (status = 409, description = "A run or remote session already holds this profile"),
-    (status = 429, description = "Automation request rate limit exceeded"),
     (status = 503, description = "No host of that operating system has a free slot"),
     (status = 500, description = "Internal server error")
   ),
@@ -4638,7 +4516,6 @@ async fn start_cookie_bot_run(
     (status = 401, description = "Unauthorized"),
     (status = 403, description = "This desktop is not signed in to Donut cloud"),
     (status = 404, description = "No such run for this account"),
-    (status = 429, description = "Automation request rate limit exceeded"),
     (status = 503, description = "The fleet could not be reached; the run is still live"),
     (status = 500, description = "Internal server error")
   ),
@@ -4732,10 +4609,8 @@ async fn get_cookie_bot_usage(
     (status = 200, description = "URL opened successfully, locally or on the profile's remote session"),
     (status = 400, description = "Cannot open URL with a cross-OS profile that is not running remotely, or the url is not an http, https or about:blank address"),
     (status = 401, description = "Unauthorized"),
-    (status = 402, description = "Active paid plan with browser automation required"),
     (status = 404, description = "Profile not found"),
     (status = 409, description = "Profile is locked by another team member, or waiting for a finished remote session to be pulled back"),
-    (status = 429, description = "Automation request rate limit exceeded"),
     (status = 503, description = "The profile lock service could not be reached, or the profile's files could not be downloaded from sync before its first launch here"),
     (status = 500, description = "Internal server error")
   ),
@@ -4749,13 +4624,6 @@ async fn open_url_in_profile(
   State(state): State<ApiServerState>,
   Json(request): Json<OpenUrlRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-  if !crate::cloud_auth::CLOUD_AUTH
-    .can_use_browser_automation()
-    .await
-  {
-    return Err((StatusCode::PAYMENT_REQUIRED, String::new()));
-  }
-
   // Same allowlist the MCP surface enforces, from the same predicate.
   if !crate::mcp_server::is_navigable_url(&request.url) {
     return Err((
@@ -4795,9 +4663,7 @@ async fn open_url_in_profile(
   responses(
     (status = 204, description = "Browser stopped, locally or on the profile's remote session"),
     (status = 401, description = "Unauthorized"),
-    (status = 402, description = "Active paid plan required"),
     (status = 404, description = "Profile not found"),
-    (status = 429, description = "Automation request rate limit exceeded"),
     (status = 503, description = "The fleet could not be reached; the remote browser is still running"),
     (status = 500, description = "Internal server error")
   ),
@@ -4812,13 +4678,6 @@ async fn kill_profile(
 ) -> Result<StatusCode, (StatusCode, String)> {
   // Programmatically launching and stopping profiles is a paid feature; the
   // run/open-url handlers gate the same way.
-  if !crate::cloud_auth::CLOUD_AUTH
-    .can_use_browser_automation()
-    .await
-  {
-    return Err((StatusCode::PAYMENT_REQUIRED, String::new()));
-  }
-
   let profile_manager = ProfileManager::instance();
   let profiles = profile_manager
     .list_profiles()
@@ -4863,8 +4722,6 @@ async fn kill_profile(
     (status = 200, description = "Batch launch completed; inspect per-profile results", body = BatchRunResponse),
     (status = 400, description = "The url is not an http, https or about:blank address"),
     (status = 401, description = "Unauthorized"),
-    (status = 402, description = "Active paid plan with browser automation required"),
-    (status = 429, description = "Automation request rate limit exceeded"),
     (status = 500, description = "Internal server error")
   ),
   security(
@@ -4876,13 +4733,6 @@ async fn batch_run_profiles(
   State(state): State<ApiServerState>,
   Json(request): Json<BatchRunRequest>,
 ) -> Result<Json<BatchRunResponse>, StatusCode> {
-  if !crate::cloud_auth::CLOUD_AUTH
-    .can_use_browser_automation()
-    .await
-  {
-    return Err(StatusCode::PAYMENT_REQUIRED);
-  }
-
   // Same allowlist the MCP surface enforces, from the same predicate. Checked
   // once up front rather than per profile: a bad scheme is a bad request, not
   // a per-profile failure.
@@ -5053,8 +4903,6 @@ async fn distribute_proxies(
   responses(
     (status = 200, description = "Batch stop completed; inspect per-profile results", body = BatchStopResponse),
     (status = 401, description = "Unauthorized"),
-    (status = 402, description = "Active paid plan with browser automation required"),
-    (status = 429, description = "Automation request rate limit exceeded"),
     (status = 500, description = "Internal server error")
   ),
   security(
@@ -5066,13 +4914,6 @@ async fn batch_stop_profiles(
   State(state): State<ApiServerState>,
   Json(request): Json<BatchStopRequest>,
 ) -> Result<Json<BatchStopResponse>, StatusCode> {
-  if !crate::cloud_auth::CLOUD_AUTH
-    .can_use_browser_automation()
-    .await
-  {
-    return Err(StatusCode::PAYMENT_REQUIRED);
-  }
-
   let profile_manager = ProfileManager::instance();
   let profiles = profile_manager
     .list_profiles()
@@ -5147,7 +4988,7 @@ async fn detect_import_profiles(
 }
 
 // API Handler - Bulk-import browser profiles from on-disk profile folders.
-// Free (parity with create_profile); only fingerprint OS spoofing is Pro.
+// Fingerprint OS selection has the same local policy as profile creation.
 // Items are isolated — one failure doesn't stop the rest.
 #[utoipa::path(
   post,
@@ -5157,7 +4998,6 @@ async fn detect_import_profiles(
     (status = 200, description = "Batch import completed; inspect per-item results", body = crate::profile_importer::ProfileImportBatchResult),
     (status = 400, description = "No items, or invalid input"),
     (status = 401, description = "Unauthorized"),
-    (status = 402, description = "Fingerprint OS spoofing requires an active Pro subscription"),
     (status = 404, description = "Group not found"),
     (status = 500, description = "Internal server error")
   ),
@@ -5184,8 +5024,6 @@ async fn import_profiles_api(
       None => None,
     };
 
-  // The Pro gate for fingerprint OS spoofing lives inside import_profiles, so
-  // every surface inherits it; manager_error_response maps the code to 402.
   let importer = crate::profile_importer::ProfileImporter::instance();
   importer
     .import_profiles(
@@ -5456,21 +5294,13 @@ async fn check_browser_downloaded(
 // and humanized input.
 //
 // REST parity for the MCP tools of the same names, from the same shared
-// operations in `mcp_server`, so the two front doors cannot drift. Gated and
-// resolved the way every automation endpoint is: 402 without the plan, 404 for
-// an unknown profile, 409 when it is not running, 429 from the shared limiter.
+// operations in `mcp_server`, so the two front doors cannot drift. These local
+// routes use the API bearer and profile state, not cloud-plan entitlements.
 
 /// The running browser behind `id`, and the engine its version entitles it to.
 async fn agent_context_for(
   id: &str,
 ) -> Result<crate::mcp_server::AgentContext, (StatusCode, String)> {
-  if !crate::cloud_auth::CLOUD_AUTH
-    .can_use_browser_automation()
-    .await
-  {
-    return Err((StatusCode::PAYMENT_REQUIRED, String::new()));
-  }
-
   let profiles = ProfileManager::instance()
     .list_profiles()
     .map_err(manager_error_response)?;
@@ -5505,33 +5335,12 @@ fn resolve_error_response(error: crate::cdp_target::ResolveError) -> (StatusCode
   }
 }
 
-/// Map a shared agent failure onto a status, with the structured detail in
-/// the body.
-///
-/// The body is the same `{"code": ..., ...}` envelope the MCP transport puts
-/// in its error `data`, plus `message`, so a locator that matched three
-/// buttons hands a REST client the same candidate list an agent gets.
-/// An agent call's answer. A browser that refuses automation as unpaid on an
-/// account whose plan includes it gets the real reason: another desktop is the
-/// primary one, or the browser's own plan token is stale.
-async fn agent_reply<T>(
-  id: &str,
+/// Map a shared agent failure to the REST response envelope, preserving the
+/// structured detail the MCP transport places in its error `data`.
+fn agent_reply<T>(
   result: Result<T, crate::mcp_server::AgentError>,
 ) -> Result<Json<T>, (StatusCode, String)> {
-  use crate::mcp_server::AgentError;
-  match result {
-    Ok(value) => Ok(Json(value)),
-    Err(AgentError::PaymentRequired(message)) => {
-      let reason = match crate::cloud_auth::CLOUD_AUTH.wayfern_device_refusal() {
-        Some(device) => Some(device),
-        None => crate::mcp_server::stale_plan_token_refusal(Some(id)).await,
-      };
-      Err(agent_error_response(AgentError::PaymentRequired(
-        reason.unwrap_or(message),
-      )))
-    }
-    Err(error) => Err(agent_error_response(error)),
-  }
+  result.map(Json).map_err(agent_error_response)
 }
 
 fn agent_error_response(error: crate::mcp_server::AgentError) -> (StatusCode, String) {
@@ -5544,8 +5353,8 @@ fn agent_error_response(error: crate::mcp_server::AgentError) -> (StatusCode, St
     | AgentError::NoMatch { .. }
     | AgentError::TypingTooLong { .. }
     | AgentError::BadRequest(_) => StatusCode::BAD_REQUEST,
-    AgentError::PaymentRequired(_) => StatusCode::PAYMENT_REQUIRED,
-    AgentError::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
+    AgentError::PaymentRequired(_) => StatusCode::BAD_GATEWAY,
+    AgentError::RateLimited(_) => StatusCode::BAD_GATEWAY,
     AgentError::AuthorizationUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
     AgentError::PickerTimedOut { .. } => StatusCode::REQUEST_TIMEOUT,
     AgentError::PickerCancelled { .. } => StatusCode::CONFLICT,
@@ -5575,10 +5384,8 @@ fn agent_error_response(error: crate::mcp_server::AgentError) -> (StatusCode, St
     (status = 200, description = "The page as the agent sees it: nodes, frames, text, stats, and a cursor when truncated. Node keys are the browser's own camelCase; `engine` says whether Wayfern 152 or the DOM fallback answered", body = crate::wayfern_cdp::PerceptionPage),
     (status = 400, description = "Malformed request, or a cursor on a profile whose browser cannot paginate"),
     (status = 401, description = "Unauthorized"),
-    (status = 402, description = "Active paid plan with browser automation required"),
     (status = 404, description = "Profile not found"),
     (status = 409, description = "The profile is not running"),
-    (status = 429, description = "Automation request rate limit exceeded"),
     (status = 502, description = "The browser did not answer as documented"),
     (status = 500, description = "Internal server error")
   ),
@@ -5592,7 +5399,7 @@ async fn agent_perceive_api(
   Json(request): Json<crate::wayfern_cdp::PerceptionRequest>,
 ) -> Result<Json<crate::wayfern_cdp::PerceptionPage>, (StatusCode, String)> {
   let ctx = agent_context_for(&id).await?;
-  agent_reply(&id, crate::mcp_server::agent_perceive(&ctx, &request).await).await
+  agent_reply(crate::mcp_server::agent_perceive(&ctx, &request).await)
 }
 
 #[utoipa::path(
@@ -5606,10 +5413,8 @@ async fn agent_perceive_api(
     (status = 200, description = "Exactly one element matched; `match` describes it", body = crate::wayfern_cdp::LocatorResolution),
     (status = 400, description = "Malformed locator, no element matched (`code` LOCATOR_NO_MATCH), or several did (`code` LOCATOR_AMBIGUOUS, with `candidates`)"),
     (status = 401, description = "Unauthorized"),
-    (status = 402, description = "Active paid plan with browser automation required"),
     (status = 404, description = "Profile not found"),
     (status = 409, description = "The profile is not running"),
-    (status = 429, description = "Automation request rate limit exceeded"),
     (status = 502, description = "The browser did not answer as documented"),
     (status = 500, description = "Internal server error")
   ),
@@ -5623,11 +5428,7 @@ async fn agent_resolve_locator_api(
   Json(request): Json<crate::mcp_server::AgentResolveRequest>,
 ) -> Result<Json<crate::wayfern_cdp::LocatorResolution>, (StatusCode, String)> {
   let ctx = agent_context_for(&id).await?;
-  agent_reply(
-    &id,
-    crate::mcp_server::agent_resolve_locator(&ctx, &request).await,
-  )
-  .await
+  agent_reply(crate::mcp_server::agent_resolve_locator(&ctx, &request).await)
 }
 
 #[utoipa::path(
@@ -5641,10 +5442,8 @@ async fn agent_resolve_locator_api(
     (status = 200, description = "The element was clicked; `navigated` says whether a page load followed", body = crate::mcp_server::AgentClick),
     (status = 400, description = "Malformed request, no element matched, or several did (see resolve-locator)"),
     (status = 401, description = "Unauthorized"),
-    (status = 402, description = "Active paid plan with browser automation required"),
     (status = 404, description = "Profile not found"),
     (status = 409, description = "The profile is not running"),
-    (status = 429, description = "Automation request rate limit exceeded"),
     (status = 502, description = "The browser did not answer as documented"),
     (status = 500, description = "Internal server error")
   ),
@@ -5658,11 +5457,7 @@ async fn agent_click_api(
   Json(request): Json<crate::mcp_server::AgentClickRequest>,
 ) -> Result<Json<crate::mcp_server::AgentClick>, (StatusCode, String)> {
   let ctx = agent_context_for(&id).await?;
-  agent_reply(
-    &id,
-    crate::mcp_server::agent_click_locator(&ctx, &request).await,
-  )
-  .await
+  agent_reply(crate::mcp_server::agent_click_locator(&ctx, &request).await)
 }
 
 #[utoipa::path(
@@ -5676,10 +5471,8 @@ async fn agent_click_api(
     (status = 200, description = "The element was pressed and held, then let go: for a press-and-hold check. The pointer moves a little while the button is down; `held_ms` is how long the button was down", body = crate::mcp_server::AgentHold),
     (status = 400, description = "Malformed request, duration_ms out of 100 to 30000, no element matched, or several did"),
     (status = 401, description = "Unauthorized"),
-    (status = 402, description = "Active paid plan with browser automation required"),
     (status = 404, description = "Profile not found"),
     (status = 409, description = "The profile is not running"),
-    (status = 429, description = "Automation request rate limit exceeded"),
     (status = 502, description = "The browser did not answer as documented"),
     (status = 500, description = "Internal server error")
   ),
@@ -5693,7 +5486,7 @@ async fn agent_hold_api(
   Json(request): Json<crate::mcp_server::AgentHoldRequest>,
 ) -> Result<Json<crate::mcp_server::AgentHold>, (StatusCode, String)> {
   let ctx = agent_context_for(&id).await?;
-  agent_reply(&id, crate::mcp_server::agent_hold(&ctx, &request).await).await
+  agent_reply(crate::mcp_server::agent_hold(&ctx, &request).await)
 }
 
 #[utoipa::path(
@@ -5707,10 +5500,8 @@ async fn agent_hold_api(
     (status = 200, description = "The text was typed, and the field read back holds it (`verified`)", body = crate::mcp_server::AgentTyping),
     (status = 400, description = "Malformed request, no element matched, several did, or the text would take longer than the typing budget (`code` TYPING_TOO_LONG)"),
     (status = 401, description = "Unauthorized"),
-    (status = 402, description = "Active paid plan with browser automation required"),
     (status = 404, description = "Profile not found"),
     (status = 409, description = "The profile is not running, or the field did not take the focus or the text (`code` TYPE_NOT_APPLIED, `reason` not_focused or value)"),
-    (status = 429, description = "Automation request rate limit exceeded"),
     (status = 502, description = "The browser did not answer as documented"),
     (status = 500, description = "Internal server error")
   ),
@@ -5725,11 +5516,9 @@ async fn agent_type_api(
 ) -> Result<Json<crate::mcp_server::AgentTyping>, (StatusCode, String)> {
   let ctx = agent_context_for(&id).await?;
   agent_reply(
-    &id,
     crate::mcp_server::agent_type_locator(&ctx, &request, crate::mcp_server::MAX_TYPING_SECONDS)
       .await,
   )
-  .await
 }
 
 #[utoipa::path(
@@ -5743,10 +5532,8 @@ async fn agent_type_api(
     (status = 200, description = "The rows read, and why reading stopped. A missing container is a result with `stopReason` no-container, not an error", body = crate::wayfern_cdp::Extraction),
     (status = 400, description = "Malformed request, or the profile runs a Wayfern older than 152 (`code` WAYFERN_152_REQUIRED)"),
     (status = 401, description = "Unauthorized"),
-    (status = 402, description = "Active paid plan with browser automation required"),
     (status = 404, description = "Profile not found"),
     (status = 409, description = "The profile is not running"),
-    (status = 429, description = "Automation request rate limit exceeded"),
     (status = 502, description = "The browser did not answer as documented"),
     (status = 500, description = "Internal server error")
   ),
@@ -5760,7 +5547,7 @@ async fn agent_extract_api(
   Json(request): Json<crate::wayfern_cdp::ExtractionRequest>,
 ) -> Result<Json<crate::wayfern_cdp::Extraction>, (StatusCode, String)> {
   let ctx = agent_context_for(&id).await?;
-  agent_reply(&id, crate::mcp_server::agent_extract(&ctx, &request).await).await
+  agent_reply(crate::mcp_server::agent_extract(&ctx, &request).await)
 }
 
 #[utoipa::path(
@@ -5774,11 +5561,9 @@ async fn agent_extract_api(
     (status = 200, description = "The user clicked an element; `locator` is the smallest description that resolves to it", body = crate::wayfern_cdp::PickedElement),
     (status = 400, description = "Malformed request, or the profile runs a Wayfern older than 152 (`code` WAYFERN_152_REQUIRED)"),
     (status = 401, description = "Unauthorized"),
-    (status = 402, description = "Active paid plan with browser automation required"),
     (status = 404, description = "Profile not found"),
     (status = 408, description = "Nothing was picked within timeout_ms; the picker has been disarmed"),
     (status = 409, description = "The profile is not running, or the picker was cancelled (Escape, or a navigation)"),
-    (status = 429, description = "Automation request rate limit exceeded"),
     (status = 502, description = "The browser did not answer as documented"),
     (status = 500, description = "Internal server error")
   ),
@@ -5796,11 +5581,7 @@ async fn agent_pick_api(
     .timeout_ms
     .unwrap_or(crate::mcp_server::DEFAULT_PICK_TIMEOUT_MS)
     .clamp(1_000, crate::mcp_server::MAX_PICK_TIMEOUT_MS);
-  agent_reply(
-    &id,
-    crate::mcp_server::agent_pick_element(&ctx, timeout_ms).await,
-  )
-  .await
+  agent_reply(crate::mcp_server::agent_pick_element(&ctx, timeout_ms).await)
 }
 
 #[cfg(test)]
@@ -6091,7 +5872,7 @@ mod tests {
   }
 
   #[test]
-  fn openapi_documents_launch_args_and_their_plan_requirement() {
+  fn openapi_documents_launch_args_without_a_plan_requirement() {
     let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
     let operation = &spec["paths"]["/v1/profiles"]["post"];
     assert!(operation["description"]
@@ -6101,12 +5882,15 @@ mod tests {
     assert!(operation["responses"]["402"]["description"]
       .as_str()
       .unwrap()
-      .contains("launch arguments"));
+      .contains("proxy"));
+    assert!(
+      spec["paths"]["/v1/templates/{id}/profiles"]["post"]["responses"]["402"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("proxy")
+    );
     for (code, expected) in [
-      (
-        "WAYFERN_LAUNCH_ARGS_REQUIRES_PRO",
-        StatusCode::PAYMENT_REQUIRED,
-      ),
+      ("WAYFERN_LAUNCH_ARGS_REQUIRES_PRO", StatusCode::BAD_REQUEST),
       ("WAYFERN_LAUNCH_ARG_INVALID", StatusCode::BAD_REQUEST),
       ("WAYFERN_LAUNCH_ARG_RESERVED", StatusCode::BAD_REQUEST),
       ("WAYFERN_LAUNCH_ARG_NOT_ALLOWED", StatusCode::BAD_REQUEST),
@@ -6174,101 +5958,6 @@ mod tests {
     assert!(is_valid("wayfern"));
     assert!(!is_valid("chromium"));
     assert!(!is_valid(""));
-  }
-
-  #[test]
-  fn rate_limit_only_classifies_browser_automation_routes() {
-    for path in [
-      "/v1/profiles/profile-id/run",
-      "/v1/profiles/profile-id/open-url",
-      "/v1/profiles/profile-id/kill",
-      // Launching on leased remote hardware is the most expensive automation
-      // action there is; it went unmetered because `run-remote` is its own
-      // path segment and never matched `run`.
-      "/v1/profiles/profile-id/run-remote",
-      "/v1/profiles/batch/run",
-      "/v1/profiles/batch/stop",
-      // Starting a bot run leases a host for up to two hours and spends the
-      // account's pooled remote-hour budget.
-      "/v1/cookie-bot/runs",
-      // The agent surface drives the same browser through the same gate.
-      "/v1/profiles/profile-id/agent/perceive",
-      "/v1/profiles/profile-id/agent/resolve-locator",
-      "/v1/profiles/profile-id/agent/click",
-      "/v1/profiles/profile-id/agent/hold",
-      "/v1/profiles/profile-id/agent/type",
-      "/v1/profiles/profile-id/agent/extract",
-      "/v1/profiles/profile-id/agent/pick",
-    ] {
-      assert!(
-        is_automation_request(&Method::POST, path),
-        "automation route was not limited: {path}"
-      );
-    }
-
-    // Stopping a remote session is a DELETE, and its handler declares a 429.
-    // Cancelling a bot run reaches the same fleet and is metered the same way.
-    for path in [
-      "/v1/remote-sessions/session-id",
-      "/v1/cookie-bot/runs/run-id",
-    ] {
-      assert!(
-        is_automation_request(&Method::DELETE, path),
-        "metered stop was not limited: {path}"
-      );
-    }
-
-    for (method, path) in [
-      (Method::GET, "/v1/profiles/profile-id/run"),
-      // Handing a fleet its proxies rewrites configuration; it never starts a
-      // browser, so metering it would spend an automation quota on nothing.
-      (Method::POST, "/v1/profiles/distribute-proxies"),
-      // Not routes: the agent segment alone, an unknown action, a nested one.
-      (Method::POST, "/v1/profiles/profile-id/agent"),
-      (Method::POST, "/v1/profiles/profile-id/agent/unknown"),
-      (Method::POST, "/v1/profiles/profile-id/agent/click/twice"),
-      (Method::GET, "/v1/profiles/profile-id/agent/perceive"),
-      (Method::POST, "/v1/profiles"),
-      (Method::POST, "/v1/profiles/import"),
-      (Method::GET, "/v1/profiles"),
-      (Method::GET, "/openapi.json"),
-      // Only the single-session DELETE is automation; the collection is not a
-      // route, and a GET of one never launches anything.
-      (Method::DELETE, "/v1/remote-sessions/"),
-      (Method::GET, "/v1/remote-sessions/session-id"),
-      (Method::GET, "/v1/remote-sessions"),
-      // Enrolling a profile is configuration and leases nothing. Metering it
-      // would 429 a client setting up many profiles, and it is not what spends
-      // the account's hours.
-      (Method::PUT, "/v1/cookie-bot/schedules/profile-id"),
-      (Method::DELETE, "/v1/cookie-bot/schedules/profile-id"),
-      (Method::GET, "/v1/cookie-bot/schedules"),
-      (Method::GET, "/v1/cookie-bot/runs"),
-      (Method::GET, "/v1/cookie-bot/usage"),
-      (Method::GET, "/v1/remote-hours"),
-      // A run id is required; the collection DELETE is not a route.
-      (Method::DELETE, "/v1/cookie-bot/runs/"),
-      // Extension writes touch this machine's own store. They start no
-      // browser, so metering them would spend an automation client's quota on
-      // uploading a `.crx`.
-      (Method::POST, "/v1/extensions"),
-      (Method::PUT, "/v1/extensions/extension-id"),
-      (Method::DELETE, "/v1/extensions/extension-id"),
-      (Method::POST, "/v1/extension-groups"),
-      (
-        Method::POST,
-        "/v1/extension-groups/group-id/extensions/extension-id",
-      ),
-      (
-        Method::DELETE,
-        "/v1/extension-groups/group-id/extensions/extension-id",
-      ),
-    ] {
-      assert!(
-        !is_automation_request(&method, path),
-        "free or non-mutating route was limited: {method} {path}"
-      );
-    }
   }
 
   // The bot exists only on the leased fleet. Every write surface resolves the
@@ -7053,11 +6742,12 @@ mod tests {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body.contains("LOCATOR_NO_MATCH"));
 
-    // The browser's own gate is the same 402 and 429 the launch routes answer.
+    // A browser-side entitlement refusal is an upstream failure, never a
+    // local API payment gate.
     let (status, _) = agent_error_response(AgentError::PaymentRequired("no plan".into()));
-    assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
     let (status, _) = agent_error_response(AgentError::RateLimited("too fast".into()));
-    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
     let (status, body) = agent_error_response(AgentError::RequiresWayfern152 {
       version: "151.0.7922.76".into(),
     });
@@ -7131,13 +6821,10 @@ mod tests {
   #[test]
   fn wayfern_refusals_carry_a_status_a_client_can_act_on() {
     for (code, expected) in [
-      (
-        "WAYFERN_CROSS_OS_REQUIRES_PLAN",
-        StatusCode::PAYMENT_REQUIRED,
-      ),
+      ("WAYFERN_CROSS_OS_REQUIRES_PLAN", StatusCode::BAD_REQUEST),
       (
         "WAYFERN_CUSTOM_FINGERPRINT_REQUIRES_PLAN",
-        StatusCode::PAYMENT_REQUIRED,
+        StatusCode::BAD_REQUEST,
       ),
       ("WAYFERN_CROSS_OS_PRIMARY_DEVICE", StatusCode::FORBIDDEN),
       (
@@ -7664,11 +7351,11 @@ mod tests {
       );
     }
 
-    for path in [
+    let automation_paths = [
+      "/v1/profiles/import",
       "/v1/profiles/{id}/run",
       "/v1/profiles/{id}/open-url",
       "/v1/profiles/{id}/kill",
-      "/v1/profiles/{id}/run-remote",
       "/v1/profiles/batch/run",
       "/v1/profiles/batch/stop",
       "/v1/profiles/{id}/agent/perceive",
@@ -7678,18 +7365,32 @@ mod tests {
       "/v1/profiles/{id}/agent/type",
       "/v1/profiles/{id}/agent/extract",
       "/v1/profiles/{id}/agent/pick",
-    ] {
+    ];
+    for path in automation_paths {
+      let responses = &paths[path]["post"]["responses"];
       assert!(
-        paths[path]["post"]["responses"].get("429").is_some(),
-        "automation route is missing its 429 response: {path}"
+        responses.get("429").is_none(),
+        "local automation route must not advertise a request quota: {path}"
       );
-      for status in ["402", "404", "409"] {
-        assert!(
-          paths[path]["post"]["responses"].get(status).is_some() || !path.contains("/agent/"),
-          "agent route is missing its {status} response: {path}"
-        );
+      assert!(
+        responses.get("402").is_none(),
+        "local automation route must not advertise a paid-plan lock: {path}"
+      );
+      if path.contains("/agent/") {
+        for status in ["404", "409"] {
+          assert!(
+            responses.get(status).is_some(),
+            "agent route is missing its {status} response: {path}"
+          );
+        }
       }
     }
+    assert!(
+      paths["/v1/profiles/{id}/run-remote"]["post"]["responses"]
+        .get("402")
+        .is_some(),
+      "the paid remote bridge remains explicitly documented"
+    );
 
     // The agent surface's bodies resolve to the components the shared
     // operations serialize, and every one of those is registered: a response
@@ -7773,20 +7474,14 @@ mod tests {
       serde_json::json!(["wayfern", "fallback"])
     );
 
-    assert!(
-      paths["/v1/cookie-bot/runs"]["post"]["responses"]
-        .get("429")
-        .is_some(),
-      "starting a bot run is metered and must declare its 429"
-    );
-
-    // The automation routes that are not POSTs. Both declared a 429 that
-    // `is_automation_request` could never produce, because that function
-    // returned early for every non-POST method.
-    for path in ["/v1/remote-sessions/{id}", "/v1/cookie-bot/runs/{run_id}"] {
+    for (path, method) in [
+      ("/v1/cookie-bot/runs", "post"),
+      ("/v1/remote-sessions/{id}", "delete"),
+      ("/v1/cookie-bot/runs/{run_id}", "delete"),
+    ] {
       assert!(
-        paths[path]["delete"]["responses"].get("429").is_some(),
-        "metered stop route is missing its 429 response: {path}"
+        paths[path][method]["responses"].get("429").is_none(),
+        "automation route must not declare a local quota: {path}"
       );
     }
 
