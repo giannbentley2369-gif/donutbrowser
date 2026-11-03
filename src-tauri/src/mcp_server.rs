@@ -21,9 +21,6 @@ use crate::wayfern_cdp::{
   PerceptionStats, PickedElement, ResolveOptions, ViewportTarget, WayfernError, WayfernSession,
 };
 
-static AUTOMATION_QUOTA: crate::log_streak::Throttle =
-  crate::log_streak::Throttle::new(std::time::Duration::from_secs(60));
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpTool {
@@ -154,8 +151,6 @@ pub struct McpRequest {
 const PROTOCOL_VERSION: &str = "2025-11-25";
 
 const INITIALIZE_INSTRUCTIONS: &str = "Donut Browser MCP server. Use tools/list to discover the browser tools. A person watches your work in Donut: call get_human_updates when you start and between steps, report_progress during longer jobs, ask_human when you are unsure, and request_human_help when a page needs a person. When a Donut tool fails in a way you cannot explain, or you need something it cannot do, tell the Donut team with send_feedback. A call refused with AGENT_PAUSED or PROFILE_HELD_BY_HUMAN means the person is in control; do not retry it until get_human_updates shows the pause or hold is gone.";
-
-const PLAN_WITHOUT_AUTOMATION: &str = " This account's plan does not include browser automation: tools that launch, drive or read a browser are refused with PLAN_REQUIRED. Managing profiles, groups, proxies, VPNs and extensions works.";
 
 /// Every MCP protocol revision this engine can speak, newest first.
 ///
@@ -412,62 +407,6 @@ fn cdp_error(error: CdpError) -> McpError {
   }
 }
 
-/// Replace the engine's plan refusal with the server's device refusal.
-///
-/// A desktop the server will not give a Wayfern token, because another desktop
-/// on the account is the primary one, launches the engine without a token, and
-/// the engine then refuses every command as "requires a paid Donut Browser
-/// plan", which is false for a paying account.
-fn explain_engine_refusal(mut error: McpError, device_refusal: Option<String>) -> McpError {
-  if error.message.contains("requires a paid Donut Browser plan") {
-    if let Some(reason) = device_refusal {
-      error.message = reason;
-    }
-  }
-  error
-}
-
-/// Why a running browser refuses automation on an account whose plan includes
-/// it, when no device refusal explains it.
-///
-/// A browser keeps the plan token it was launched with for its whole life.
-/// That token expires, and a launch while the token service did not answer
-/// gets none, so only a new launch gives the browser a token that works.
-pub(crate) async fn stale_plan_token_refusal(profile_id: Option<&str>) -> Option<String> {
-  if CLOUD_AUTH.wayfern_device_refusal().is_some() || !CLOUD_AUTH.can_use_browser_automation().await
-  {
-    return None;
-  }
-  let running_for = profile_id
-    .and_then(|id| {
-      crate::profile::ProfileManager::instance()
-        .find_profile(id)
-        .ok()
-    })
-    .and_then(|profile| profile.process_id)
-    .and_then(crate::proxy_storage::process_start_time)
-    .and_then(|start| {
-      let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-      Some(now.saturating_sub(start))
-    });
-  Some(stale_plan_token_message(running_for))
-}
-
-fn stale_plan_token_message(running_for: Option<u64>) -> String {
-  let age = running_for
-    .map(|secs| format!(" This browser has run for {} h.", secs / 3600))
-    .unwrap_or_default();
-  format!(
-    "This browser cannot confirm the plan, although the account includes browser automation: \
-     a browser keeps the plan token it was launched with, and that token has expired, or the \
-     token service did not answer when the browser started.{age} Restart the profile to \
-     automate it: call kill_profile, then run_profile."
-  )
-}
-
 /// The create_profile result. A setting that failed after the profile was
 /// created is named as not applied, so the agent never takes it as set.
 fn created_profile_result(
@@ -568,8 +507,6 @@ pub(crate) enum McpOutcome {
   UnknownSession,
   /// The payload was not a JSON-RPC message.
   BadRequest,
-  /// The shared automation limiter refused the call.
-  RateLimited { retry_after_secs: u64 },
 }
 
 pub struct McpServer {
@@ -4649,20 +4586,6 @@ impl McpServer {
       }
     }
 
-    if Self::is_automation_tool_call(&request) && !Self::refused_by_console(&request) {
-      if let crate::automation_rate_limiter::RateLimitOutcome::Limited { retry_after_secs } =
-        crate::automation_rate_limiter::check_automation_rate_limit().await
-      {
-        if let Some(dropped) = AUTOMATION_QUOTA.allow("limited") {
-          log::warn!(
-            "MCP automation rate limited retry_after_s={retry_after_secs}{}",
-            crate::log_streak::suppressed(dropped)
-          );
-        }
-        return McpOutcome::RateLimited { retry_after_secs };
-      }
-    }
-
     let response = self
       .handle_request(
         McpCaller {
@@ -4676,37 +4599,6 @@ impl McpServer {
       body: serde_json::to_value(response).unwrap_or_else(|_| serde_json::json!({})),
       new_session_id: None,
     }
-  }
-
-  fn is_automation_tool_call(request: &McpRequest) -> bool {
-    if request.method != "tools/call" {
-      return false;
-    }
-
-    let Some(tool_name) = request
-      .params
-      .as_ref()
-      .and_then(|params| params.get("name"))
-      .and_then(|name| name.as_str())
-    else {
-      return false;
-    };
-
-    Self::is_automation_tool(tool_name)
-  }
-
-  /// A call the person has paused or taken over does not count against the quota.
-  fn refused_by_console(request: &McpRequest) -> bool {
-    let Some(params) = request.params.as_ref() else {
-      return false;
-    };
-    let tool_name = params
-      .get("name")
-      .and_then(serde_json::Value::as_str)
-      .unwrap_or_default();
-    let empty = serde_json::json!({});
-    let arguments = params.get("arguments").unwrap_or(&empty);
-    crate::agent_console::check_call(Self::is_passive_tool(tool_name), arguments).is_err()
   }
 
   fn is_automation_tool(tool_name: &str) -> bool {
@@ -7101,9 +6993,6 @@ impl McpServer {
     }
 
     let mut instructions = INITIALIZE_INSTRUCTIONS.to_string();
-    if !CLOUD_AUTH.can_use_browser_automation().await {
-      instructions.push_str(PLAN_WITHOUT_AUTOMATION);
-    }
     if let Some(selection) = toolsets {
       let missing = selection.missing();
       if !missing.is_empty() {
@@ -7269,18 +7158,7 @@ impl McpServer {
       return Err(error);
     }
 
-    let mut result = self
-      .dispatch_tool_call(caller, tool_name, &arguments)
-      .await
-      .map_err(|error| explain_engine_refusal(error, CLOUD_AUTH.wayfern_device_refusal()));
-    if let Err(error) = &mut result {
-      if error.message.contains("requires a paid Donut Browser plan") {
-        let profile = arguments.get("profile_id").and_then(|v| v.as_str());
-        if let Some(reason) = stale_plan_token_refusal(profile).await {
-          error.message = reason;
-        }
-      }
-    }
+    let mut result = self.dispatch_tool_call(caller, tool_name, &arguments).await;
     let elapsed_ms = started.elapsed().as_millis();
     if human_tool {
       crate::agent_console::touch_session(caller.session);
@@ -7334,38 +7212,10 @@ impl McpServer {
       "get_diagnostics" => self.handle_get_diagnostics(arguments).await,
       "list_profiles" => self.handle_list_profiles(arguments).await,
       "get_profile" => self.handle_get_profile(arguments).await,
-      "run_profile" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_run_profile(arguments).await
-      }
-      "kill_profile" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_kill_profile(arguments).await
-      }
-      "batch_run_profiles" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_batch_run_profiles(arguments).await
-      }
-      "batch_stop_profiles" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_batch_stop_profiles(arguments).await
-      }
+      "run_profile" => self.handle_run_profile(arguments).await,
+      "kill_profile" => self.handle_kill_profile(arguments).await,
+      "batch_run_profiles" => self.handle_batch_run_profiles(arguments).await,
+      "batch_stop_profiles" => self.handle_batch_stop_profiles(arguments).await,
       "create_profile" => self.handle_create_profile(arguments).await,
       // Profile import (free, like create_profile — importing is not automation)
       "detect_browser_profiles" => self.handle_detect_browser_profiles(arguments).await,
@@ -7453,18 +7303,9 @@ impl McpServer {
       "connect_vpn" => self.handle_connect_vpn(arguments).await,
       "disconnect_vpn" => self.handle_disconnect_vpn(arguments).await,
       "get_vpn_status" => self.handle_get_vpn_status(arguments).await,
-      // Fingerprint management — viewing is free everywhere (matches the REST
-      // API and the get_profile tool, which already expose the config); only
-      // editing requires a paid plan.
+      // Fingerprint management.
       "get_profile_fingerprint" => self.handle_get_profile_fingerprint(arguments).await,
-      "update_profile_fingerprint" => {
-        Self::require_capability(
-          "Fingerprint editing",
-          CLOUD_AUTH.can_use_cross_os_fingerprints().await,
-        )
-        .await?;
-        self.handle_update_profile_fingerprint(arguments).await
-      }
+      "update_profile_fingerprint" => self.handle_update_profile_fingerprint(arguments).await,
       "update_profile_proxy_bypass_rules" => {
         self
           .handle_update_profile_proxy_bypass_rules(arguments)
@@ -7495,283 +7336,54 @@ impl McpServer {
       "get_team_locks" => self.handle_get_team_locks().await,
       "get_team_lock_status" => self.handle_get_team_lock_status(arguments).await,
       // Synchronizer tools
-      "start_sync_session" => {
-        Self::require_capability(
-          "Synchronizer",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_start_sync_session(arguments).await
-      }
+      "start_sync_session" => self.handle_start_sync_session(arguments).await,
       "stop_sync_session" => self.handle_stop_sync_session(arguments).await,
       "get_sync_sessions" => self.handle_get_sync_sessions().await,
       "remove_sync_follower" => self.handle_remove_sync_follower(arguments).await,
       // Browser interaction tools (require paid subscription)
-      "navigate" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_navigate(arguments).await
-      }
-      "screenshot" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_screenshot(arguments).await
-      }
-      "run_actions" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_run_actions(caller, arguments).await
-      }
-      "list_tabs" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_list_tabs(arguments).await
-      }
-      "open_tab" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_open_tab(arguments).await
-      }
-      "switch_tab" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_switch_tab(arguments).await
-      }
-      "close_tab" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_close_tab(arguments).await
-      }
-      "scroll" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_scroll(arguments).await
-      }
-      "press_key" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_press_key(arguments).await
-      }
-      "go_back" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_go_back(arguments).await
-      }
-      "wait_for" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_wait_for(arguments).await
-      }
-      "evaluate_javascript" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_evaluate_javascript(arguments).await
-      }
-      "click_element" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_click_element(arguments).await
-      }
-      "type_text" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_type_text(arguments).await
-      }
-      "get_page_content" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_get_page_content(arguments).await
-      }
-      "get_page_info" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_get_page_info(arguments).await
-      }
+      "navigate" => self.handle_navigate(arguments).await,
+      "screenshot" => self.handle_screenshot(arguments).await,
+      "run_actions" => self.handle_run_actions(caller, arguments).await,
+      "list_tabs" => self.handle_list_tabs(arguments).await,
+      "open_tab" => self.handle_open_tab(arguments).await,
+      "switch_tab" => self.handle_switch_tab(arguments).await,
+      "close_tab" => self.handle_close_tab(arguments).await,
+      "scroll" => self.handle_scroll(arguments).await,
+      "press_key" => self.handle_press_key(arguments).await,
+      "go_back" => self.handle_go_back(arguments).await,
+      "wait_for" => self.handle_wait_for(arguments).await,
+      "evaluate_javascript" => self.handle_evaluate_javascript(arguments).await,
+      "click_element" => self.handle_click_element(arguments).await,
+      "type_text" => self.handle_type_text(arguments).await,
+      "get_page_content" => self.handle_get_page_content(arguments).await,
+      "get_page_info" => self.handle_get_page_info(arguments).await,
       "get_interactive_elements" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
         self
           .handle_get_interactive_elements(caller, arguments)
           .await
       }
-      "click_by_index" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_click_by_index(caller, arguments).await
-      }
-      "type_by_index" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_type_by_index(caller, arguments).await
-      }
+      "click_by_index" => self.handle_click_by_index(caller, arguments).await,
+      "type_by_index" => self.handle_type_by_index(caller, arguments).await,
       // The agent surface: perception, locators, extraction, the picker and
       // humanized input. Gated exactly like click_element, because every one
       // of them drives, or reads, the same browser.
-      "perceive_page" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_perceive_page(arguments).await
-      }
-      "resolve_locator" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_resolve_locator(arguments).await
-      }
-      "click_locator" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_click_locator(arguments).await
-      }
-      "press_and_hold" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_press_and_hold(caller, arguments).await
-      }
-      "type_locator" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_type_locator(arguments).await
-      }
-      "select_option" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_select_option(caller, arguments).await
-      }
-      "file_upload" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_file_upload(caller, arguments).await
-      }
-      "start_network_capture" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_start_network_capture(arguments).await
-      }
+      "perceive_page" => self.handle_perceive_page(arguments).await,
+      "resolve_locator" => self.handle_resolve_locator(arguments).await,
+      "click_locator" => self.handle_click_locator(arguments).await,
+      "press_and_hold" => self.handle_press_and_hold(caller, arguments).await,
+      "type_locator" => self.handle_type_locator(arguments).await,
+      "select_option" => self.handle_select_option(caller, arguments).await,
+      "file_upload" => self.handle_file_upload(caller, arguments).await,
+      "start_network_capture" => self.handle_start_network_capture(arguments).await,
       // Stopping only deletes; it works without a plan, like stop_sync_session.
       "stop_network_capture" => Self::handle_stop_network_capture(arguments),
-      "list_network_requests" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        Self::handle_list_network_requests(arguments)
-      }
-      "get_network_request" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        Self::handle_get_network_request(arguments)
-      }
-      "extract_structured" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_extract_structured(arguments).await
-      }
-      "pick_element" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_pick_element(arguments).await
-      }
+      "list_network_requests" => Self::handle_list_network_requests(arguments),
+      "get_network_request" => Self::handle_get_network_request(arguments),
+      "extract_structured" => self.handle_extract_structured(arguments).await,
+      "pick_element" => self.handle_pick_element(arguments).await,
       // Leasing a host is the most expensive thing this server can do, so it
       // is gated exactly like the local launch it replaces.
-      "run_profile_remote" => {
-        Self::require_capability(
-          "Browser automation",
-          CLOUD_AUTH.can_use_browser_automation().await,
-        )
-        .await?;
-        self.handle_run_profile_remote(arguments).await
-      }
+      "run_profile_remote" => self.handle_run_profile_remote(arguments).await,
       // No capability gate on the stop. A lapsed plan must never be the reason
       // an agent cannot end something that is spending hours.
       "stop_remote_session" => Self::handle_stop_remote_session(arguments).await,
@@ -7883,11 +7495,6 @@ impl McpServer {
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
     // Launching profiles programmatically requires the automation capability.
-    Self::require_capability(
-      "Launching a profile",
-      CLOUD_AUTH.can_use_browser_automation().await,
-    )
-    .await?;
 
     let profile_id = arguments
       .get("profile_id")
@@ -8017,11 +7624,6 @@ impl McpServer {
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
     // Stopping profiles programmatically requires the automation capability.
-    Self::require_capability(
-      "Killing a profile",
-      CLOUD_AUTH.can_use_browser_automation().await,
-    )
-    .await?;
 
     let profile_id = arguments
       .get("profile_id")
@@ -8106,12 +7708,6 @@ impl McpServer {
     &self,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
-    Self::require_capability(
-      "Batch launching profiles",
-      CLOUD_AUTH.can_use_browser_automation().await,
-    )
-    .await?;
-
     let profile_ids: Vec<String> = arguments
       .get("profile_ids")
       .and_then(|v| v.as_array())
@@ -8203,12 +7799,6 @@ impl McpServer {
     &self,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
-    Self::require_capability(
-      "Batch stopping profiles",
-      CLOUD_AUTH.can_use_browser_automation().await,
-    )
-    .await?;
-
     let profile_ids: Vec<String> = arguments
       .get("profile_ids")
       .and_then(|v| v.as_array())
@@ -10198,14 +9788,6 @@ impl McpServer {
     &self,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
-    if !CLOUD_AUTH.can_use_cross_os_fingerprints().await {
-      return Err(McpError {
-        code: -32000,
-        message: "Fingerprint editing requires a plan that includes it".to_string(),
-        data: None,
-      });
-    }
-
     let profile_id = arguments
       .get("profile_id")
       .and_then(|v| v.as_str())
@@ -10236,19 +9818,6 @@ impl McpServer {
     let randomize = arguments
       .get("randomize_fingerprint_on_launch")
       .and_then(|v| v.as_bool());
-
-    if let Some(os_val) = os {
-      if !CLOUD_AUTH.is_fingerprint_os_allowed(Some(os_val)).await {
-        return Err(McpError {
-          code: -32000,
-          message: format!(
-            "OS spoofing to '{}' requires an active Pro subscription",
-            os_val
-          ),
-          data: None,
-        });
-      }
-    }
 
     let profiles = ProfileManager::instance()
       .list_profiles()
@@ -10454,13 +10023,6 @@ impl McpServer {
   }
 
   async fn handle_list_extensions(&self) -> Result<serde_json::Value, McpError> {
-    if !CLOUD_AUTH.has_active_paid_subscription().await {
-      return Err(McpError {
-        code: -32000,
-        message: "Extension management requires an active Pro subscription".to_string(),
-        data: None,
-      });
-    }
     let mgr = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
     let extensions = mgr.list_extensions().map_err(|e| McpError {
       code: -32000,
@@ -10471,13 +10033,6 @@ impl McpServer {
   }
 
   async fn handle_list_extension_groups(&self) -> Result<serde_json::Value, McpError> {
-    if !CLOUD_AUTH.has_active_paid_subscription().await {
-      return Err(McpError {
-        code: -32000,
-        message: "Extension management requires an active Pro subscription".to_string(),
-        data: None,
-      });
-    }
     let mgr = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
     let groups = mgr.list_groups().map_err(|e| McpError {
       code: -32000,
@@ -10491,13 +10046,6 @@ impl McpServer {
     &self,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
-    if !CLOUD_AUTH.has_active_paid_subscription().await {
-      return Err(McpError {
-        code: -32000,
-        message: "Extension management requires an active Pro subscription".to_string(),
-        data: None,
-      });
-    }
     let path = arguments
       .get("path")
       .and_then(|v| v.as_str())
@@ -10535,13 +10083,6 @@ impl McpServer {
     &self,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
-    if !CLOUD_AUTH.has_active_paid_subscription().await {
-      return Err(McpError {
-        code: -32000,
-        message: "Extension management requires an active Pro subscription".to_string(),
-        data: None,
-      });
-    }
     let extension_id = arguments
       .get("extension_id")
       .and_then(|v| v.as_str())
@@ -10592,13 +10133,6 @@ impl McpServer {
     &self,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
-    if !CLOUD_AUTH.has_active_paid_subscription().await {
-      return Err(McpError {
-        code: -32000,
-        message: "Extension management requires an active Pro subscription".to_string(),
-        data: None,
-      });
-    }
     let name = arguments
       .get("name")
       .and_then(|v| v.as_str())
@@ -10620,13 +10154,6 @@ impl McpServer {
     &self,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
-    if !CLOUD_AUTH.has_active_paid_subscription().await {
-      return Err(McpError {
-        code: -32000,
-        message: "Extension management requires an active Pro subscription".to_string(),
-        data: None,
-      });
-    }
     let group_id = arguments
       .get("group_id")
       .and_then(|v| v.as_str())
@@ -10663,13 +10190,6 @@ impl McpServer {
     &self,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
-    if !CLOUD_AUTH.has_active_paid_subscription().await {
-      return Err(McpError {
-        code: -32000,
-        message: "Extension management requires an active Pro subscription".to_string(),
-        data: None,
-      });
-    }
     let (group_id, extension_id) = Self::group_and_extension_ids(arguments)?;
     let mgr = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
     let group = mgr
@@ -10686,13 +10206,6 @@ impl McpServer {
     &self,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
-    if !CLOUD_AUTH.has_active_paid_subscription().await {
-      return Err(McpError {
-        code: -32000,
-        message: "Extension management requires an active Pro subscription".to_string(),
-        data: None,
-      });
-    }
     let (group_id, extension_id) = Self::group_and_extension_ids(arguments)?;
     let mgr = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
     let group = mgr
@@ -10729,13 +10242,6 @@ impl McpServer {
     &self,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
-    if !CLOUD_AUTH.has_active_paid_subscription().await {
-      return Err(McpError {
-        code: -32000,
-        message: "Extension management requires an active Pro subscription".to_string(),
-        data: None,
-      });
-    }
     let extension_id = arguments
       .get("extension_id")
       .and_then(|v| v.as_str())
@@ -10759,13 +10265,6 @@ impl McpServer {
     &self,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
-    if !CLOUD_AUTH.has_active_paid_subscription().await {
-      return Err(McpError {
-        code: -32000,
-        message: "Extension management requires an active Pro subscription".to_string(),
-        data: None,
-      });
-    }
     let group_id = arguments
       .get("group_id")
       .and_then(|v| v.as_str())
@@ -10792,13 +10291,6 @@ impl McpServer {
     &self,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
-    if !CLOUD_AUTH.has_active_paid_subscription().await {
-      return Err(McpError {
-        code: -32000,
-        message: "Extension management requires an active Pro subscription".to_string(),
-        data: None,
-      });
-    }
     let profile_id = arguments
       .get("profile_id")
       .and_then(|v| v.as_str())
@@ -13559,35 +13051,6 @@ mod tests {
   use super::*;
 
   #[test]
-  fn an_engine_plan_refusal_is_explained_by_a_device_refusal() {
-    let engine = || {
-      McpError {
-      code: -32000,
-      message: r#"CDP error: {"code":-32000,"message":"Browser automation requires a paid Donut Browser plan."}"#
-        .to_string(),
-      data: None,
-    }
-    };
-    let device = "Browser automation is restricted to your primary device. Log out other devices to use it here.";
-    assert_eq!(
-      explain_engine_refusal(engine(), Some(device.to_string())).message,
-      device
-    );
-    assert_eq!(
-      explain_engine_refusal(engine(), None).message,
-      engine().message
-    );
-    let other = McpError {
-      code: -32000,
-      message: "Profile not found".to_string(),
-      data: None,
-    };
-    assert_eq!(
-      explain_engine_refusal(other, Some(device.to_string())).message,
-      "Profile not found"
-    );
-  }
-  #[test]
   fn every_tool_has_explicit_annotations() {
     for tool in McpServer::new().get_tools() {
       let hints = tool_hints(&tool.name);
@@ -13623,18 +13086,6 @@ mod tests {
     assert_eq!(navigate["annotations"]["openWorldHint"], true);
     let list = tools.iter().find(|t| t["name"] == "list_profiles").unwrap();
     assert_eq!(list["annotations"]["readOnlyHint"], true);
-  }
-
-  #[test]
-  fn a_stale_plan_token_says_to_restart_and_how_long_the_browser_ran() {
-    let message = stale_plan_token_message(Some(204_189));
-    assert!(message.contains("56 h"), "{message}");
-    assert!(
-      message.contains("kill_profile, then run_profile"),
-      "{message}"
-    );
-    assert!(!message.contains("requires a paid"), "{message}");
-    assert!(!stale_plan_token_message(None).contains(" h."));
   }
 
   #[test]
@@ -15515,87 +14966,6 @@ mod tests {
     assert!(!required.iter().any(|field| field == "port"));
   }
 
-  #[test]
-  fn rate_limit_only_classifies_browser_automation_tools() {
-    let request = |method: &str, name: Option<&str>| McpRequest {
-      jsonrpc: "2.0".to_string(),
-      id: Some(serde_json::json!(1)),
-      method: method.to_string(),
-      params: name.map(|name| serde_json::json!({ "name": name, "arguments": {} })),
-    };
-
-    for name in [
-      "run_profile",
-      "kill_profile",
-      "batch_run_profiles",
-      "batch_stop_profiles",
-      "start_sync_session",
-      "navigate",
-      "screenshot",
-      "evaluate_javascript",
-      "click_element",
-      "type_text",
-      "get_page_content",
-      "get_page_info",
-      "get_interactive_elements",
-      "click_by_index",
-      "type_by_index",
-      // The agent surface reads and drives the same browser.
-      "perceive_page",
-      "resolve_locator",
-      "click_locator",
-      "type_locator",
-      "extract_structured",
-      "pick_element",
-      "select_option",
-      "file_upload",
-      // A capture reads every request the browser makes.
-      "start_network_capture",
-      "list_network_requests",
-      "get_network_request",
-      // Leases a remote host for up to two hours and spends the pooled
-      // remote-hour budget.
-      "run_cookie_bot_now",
-      "run_profile_remote",
-      // Reaches the fleet, like the remote-session stop it mirrors.
-      "cancel_cookie_bot_run",
-      "stop_remote_session",
-    ] {
-      assert!(
-        McpServer::is_automation_tool_call(&request("tools/call", Some(name))),
-        "automation tool was not limited: {name}"
-      );
-    }
-
-    for name in [
-      "list_profiles",
-      // Configuration, not automation: nothing is leased. Metering it would
-      // throttle an agent enrolling many profiles, and it is not what spends
-      // the account's hours.
-      "set_cookie_bot_schedule",
-      "delete_cookie_bot_schedule",
-      "list_cookie_bot_schedules",
-      "get_cookie_bot_schedule",
-      "check_cookie_bot_conflicts",
-      "list_cookie_bot_runs",
-      "list_cookie_bot_presets",
-      "get_cookie_bot_usage",
-      "get_remote_hours_quota",
-      "list_remote_sessions",
-      "get_remote_session",
-    ] {
-      assert!(
-        !McpServer::is_automation_tool_call(&request("tools/call", Some(name))),
-        "free or non-leasing tool was limited: {name}"
-      );
-    }
-
-    assert!(!McpServer::is_automation_tool_call(&request(
-      "tools/list",
-      None
-    )));
-  }
-
   // --- The agent surface --------------------------------------------------
   //
   // Driven against the fake Wayfern socket in `wayfern_cdp::test_support`,
@@ -16868,7 +16238,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn every_agent_tool_is_advertised_gated_and_dispatchable() {
+  async fn every_agent_tool_is_advertised_ungated_and_dispatchable() {
     let server = McpServer::new();
     let advertised: Vec<String> = server.get_tools().into_iter().map(|t| t.name).collect();
     let production = include_str!("mcp_server.rs")
@@ -16898,13 +16268,13 @@ mod tests {
         "{tool} is not advertised"
       );
       let arm = dispatch
-        .split(&format!("\"{tool}\" => {{"))
+        .split(&format!("\"{tool}\" => "))
         .nth(1)
         .unwrap_or_else(|| panic!("{tool} is not dispatched"));
-      let arm = &arm[..arm.find("\n      }").unwrap_or(arm.len())];
+      let arm = &arm[..arm.find('\n').unwrap_or(arm.len())];
       assert!(
-        arm.contains("can_use_browser_automation"),
-        "{tool} must sit behind the browser-automation gate"
+        !arm.contains("can_use_browser_automation") && !arm.contains("require_capability"),
+        "{tool} must not require a cloud-plan entitlement"
       );
       // Every one of them takes a profile id and nothing from this disk, so
       // the bridge is allowed to call them.
@@ -16912,8 +16282,8 @@ mod tests {
       assert!(!SECRET_EXPORT_TOOLS.contains(&tool));
     }
 
-    // And over the bridge they are answered, not refused as local-only. They
-    // fail here for want of a browser, never with the local-only code.
+    // The local tool surface is available over the bridge; with no browser
+    // fixture the call fails for browser state, never for a missing plan.
     server.mark_engine_ready_for_tests();
     let call = serde_json::json!({
       "jsonrpc": "2.0",
@@ -16927,8 +16297,8 @@ mod tests {
     };
     let message = body["error"]["message"].as_str().unwrap_or_default();
     assert!(
-      !message.contains("TOOL_IS_LOCAL_ONLY"),
-      "the agent surface must be reachable over the bridge: {body}"
+      !message.contains("TOOL_IS_LOCAL_ONLY") && !message.contains("PLAN_REQUIRED"),
+      "the agent surface must not require a paid plan: {body}"
     );
   }
 

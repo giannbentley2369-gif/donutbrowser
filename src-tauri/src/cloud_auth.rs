@@ -1372,35 +1372,14 @@ impl CloudAuthManager {
       .unwrap_or(false)
   }
 
+  /// Local automation is available independently of the cloud subscription.
   pub async fn can_use_browser_automation(&self) -> bool {
-    #[cfg(feature = "e2e")]
-    if crate::e2e_automation_enabled()
-      && std::env::var_os("WAYFERN_TEST_TOKEN").is_some_and(|token| !token.is_empty())
-    {
-      return true;
-    }
-
-    self
-      .entitlements()
-      .await
-      .map(|e| e.browser_automation)
-      .unwrap_or(false)
+    true
   }
 
-  /// Edit fingerprints / use a non-native OS fingerprint.
+  /// Local fingerprint editing is available on every installation.
   pub async fn can_use_cross_os_fingerprints(&self) -> bool {
-    #[cfg(feature = "e2e")]
-    if crate::e2e_automation_enabled()
-      && std::env::var_os("WAYFERN_TEST_TOKEN").is_some_and(|token| !token.is_empty())
-    {
-      return true;
-    }
-
-    self
-      .entitlements()
-      .await
-      .map(|e| e.cross_os_fingerprints)
-      .unwrap_or(false)
+    true
   }
 
   /// Cloud profile sync / backup (async).
@@ -1421,26 +1400,6 @@ impl CloudAuthManager {
         .unwrap_or(false),
       Err(_) => false,
     }
-  }
-
-  /// Identity and positive per-hour cap for the shared REST/MCP automation
-  /// limiter. No active automation entitlement means no limiter entry; the
-  /// capability gates still reject paid operations independently.
-  pub async fn automation_rate_limit(&self) -> Option<(String, u64)> {
-    #[cfg(feature = "e2e")]
-    if crate::e2e_automation_enabled() {
-      if let Ok(limit) = std::env::var("DONUT_E2E_REQUESTS_PER_HOUR") {
-        if let Ok(limit) = limit.parse::<u64>() {
-          if limit > 0 {
-            return Some(("e2e-automation".to_string(), limit));
-          }
-        }
-      }
-    }
-
-    let state = self.get_user().await?;
-    let limit = state.user.entitlements().requests_per_hour;
-    (limit > 0).then_some((state.user.id, limit as u64))
   }
 
   pub async fn is_fingerprint_os_allowed(&self, fingerprint_os: Option<&str>) -> bool {
@@ -2364,6 +2323,52 @@ mod tests {
       refusal_message("Failed to request wayfern token: timeout"),
       "Failed to request wayfern token: timeout"
     );
+  }
+
+  #[tokio::test]
+  async fn local_automation_and_fingerprints_do_not_require_cloud_auth() {
+    let manager = CloudAuthManager {
+      client: crate::app_proxy::SharedClient::new(|builder| builder),
+      state: Mutex::new(None),
+      refresh_lock: tokio::sync::Mutex::new(()),
+      refresh_deferred_until: std::sync::Mutex::new(None),
+      wayfern_token: Mutex::new(None),
+      wayfern_token_minted_at: std::sync::Mutex::new(None),
+      wayfern_device_refusal: std::sync::Mutex::new(None),
+    };
+    assert!(manager.can_use_browser_automation().await);
+    assert!(manager.can_use_cross_os_fingerprints().await);
+    for os in [
+      None,
+      Some("windows"),
+      Some("macos"),
+      Some("linux"),
+      Some("android"),
+      Some("ios"),
+    ] {
+      assert!(manager.is_fingerprint_os_allowed(os).await);
+    }
+
+    let user: CloudUser = serde_json::from_value(serde_json::json!({
+      "id": "local-test",
+      "email": "",
+      "plan": "free",
+      "subscriptionStatus": "canceled",
+      "profileLimit": 0,
+      "cloudProfilesUsed": 0,
+      "proxyBandwidthLimitMb": 0,
+      "proxyBandwidthUsedMb": 0,
+      "entitlements": { "active": false }
+    }))
+    .unwrap();
+    *manager.state.lock().await = Some(CloudAuthState {
+      user,
+      logged_in_at: String::new(),
+    });
+    let _state = manager.state.lock().await;
+    assert!(manager.can_use_browser_automation().await);
+    assert!(manager.can_use_cross_os_fingerprints().await);
+    assert!(manager.is_fingerprint_os_allowed(Some("windows")).await);
   }
 
   #[test]

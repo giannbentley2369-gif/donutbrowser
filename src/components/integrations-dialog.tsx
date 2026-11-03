@@ -747,11 +747,10 @@ export function IntegrationsDialog({
     },
   ];
 
-  // Remote control is not something a regular user is told about: the tab
-  // exists only for an account entitled to it, or while the bridge is already
-  // on so it can always be switched off. Nothing else on the page names it.
-  const remoteTabShown =
-    remoteEntitled || settings.mcp_remote_enabled || (remote?.enabled ?? false);
+  // Keep the remote integration discoverable. Starting its bridge still needs
+  // cloud sign-in and accepted terms; endpoint credentials still use the
+  // service's own entitlement response below.
+  const remoteTabShown = true;
   // A tab that is not offered cannot be the one displayed, whether the caller
   // asked for it or it vanished under the user.
   const shownTab: IntegrationsTab =

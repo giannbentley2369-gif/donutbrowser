@@ -197,7 +197,7 @@ export type LocalApiExampleId =
 export interface ApiExample<Id extends string = string> {
   id: Id;
   request: RequestSpec;
-  /** Needs a paid plan with browser automation; the route answers 402 otherwise. */
+  /** Optional plan label for examples that use hosted services. */
   paid?: boolean;
   response: string;
 }
@@ -226,7 +226,6 @@ export const LOCAL_API_EXAMPLES: readonly ApiExample<LocalApiExampleId>[] = [
   },
   {
     id: "runProfile",
-    paid: true,
     request: {
       method: "POST",
       path: `/v1/profiles/${PROFILE_ID_PLACEHOLDER}/run`,
@@ -244,7 +243,6 @@ export const LOCAL_API_EXAMPLES: readonly ApiExample<LocalApiExampleId>[] = [
   },
   {
     id: "openUrl",
-    paid: true,
     request: {
       method: "POST",
       path: `/v1/profiles/${PROFILE_ID_PLACEHOLDER}/open-url`,
@@ -255,7 +253,6 @@ export const LOCAL_API_EXAMPLES: readonly ApiExample<LocalApiExampleId>[] = [
   },
   {
     id: "killProfile",
-    paid: true,
     request: {
       method: "POST",
       path: `/v1/profiles/${PROFILE_ID_PLACEHOLDER}/kill`,
